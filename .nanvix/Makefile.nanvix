@@ -6,10 +6,20 @@
 #    NANVIX_TOOLCHAIN=<toolchain> [target]
 #
 # Targets:
-#   all              Build libxslt.a, libexslt.a, and the test ELF
+#   all              Build libxslt.{a,so}, libexslt.{a,so}, and the test ELF
 #   test             Verify functional-test prerequisites (build artifacts).
 #                    The runtime execution is driven by z.py on the host.
 #   clean            Remove build artifacts
+#
+# Dependencies:
+#   The shared-library build requires:
+#   * The Nanvix dynamic loader to honour `.init_array` constructors and
+#     DT_NEEDED resolution chains (esaurez/nanvix#27).
+#   * `libxml2.so` to be present in the buildroot, shipped by the
+#     companion esaurez/libxml2 release that ships libxml2.so.
+#   libxslt.so is linked with DT_NEEDED libxml2.so, and libexslt.so is
+#   linked with DT_NEEDED libxslt.so libxml2.so, so the loader pulls
+#   the lower-level libraries automatically at dlopen time.
 
 # ===========================================================================
 # Global Variables
@@ -28,10 +38,12 @@ EXE = .elf
 
 STATICLIB_XSLT  := libxslt/.libs/libxslt.a
 STATICLIB_EXSLT := libexslt/.libs/libexslt.a
+SHAREDLIB_XSLT  := libxslt/.libs/libxslt.so
+SHAREDLIB_EXSLT := libexslt/.libs/libexslt.so
 TEST_SRC        := .nanvix/test/test_libxslt.c
 TEST_ELF        := test_libxslt$(EXE)
 
-_NANVIX_DOCKER_BUILD_GOALS := all $(STATICLIB_XSLT) $(STATICLIB_EXSLT) $(TEST_ELF)
+_NANVIX_DOCKER_BUILD_GOALS := all $(STATICLIB_XSLT) $(STATICLIB_EXSLT) $(SHAREDLIB_XSLT) $(SHAREDLIB_EXSLT) $(TEST_ELF)
 _NANVIX_GOALS := $(or $(MAKECMDGOALS),$(.DEFAULT_GOAL))
 
 # Ensure required variables are defined.
@@ -66,8 +78,13 @@ endif
 # Build Targets
 # ===========================================================================
 
-all: $(STATICLIB_XSLT) $(STATICLIB_EXSLT) $(TEST_ELF)
+all: $(STATICLIB_XSLT) $(STATICLIB_EXSLT) $(SHAREDLIB_XSLT) $(SHAREDLIB_EXSLT) $(TEST_ELF)
 
+# Build the static archives with -fPIC so the same objects can be
+# linked into position-independent .so files below. autotools'
+# libtool shared-library detection does not know about i686-nanvix,
+# so we keep --disable-shared and link the .so files ourselves from
+# the .a archives.
 $(STATICLIB_XSLT) $(STATICLIB_EXSLT):
 	sh -c '\
 	  export PATH="$(NANVIX_TOOLCHAIN)/bin:$$PATH" && \
@@ -77,14 +94,45 @@ $(STATICLIB_XSLT) $(STATICLIB_EXSLT):
 	    --enable-static --disable-shared --disable-maintainer-mode \
 	    --without-python --without-crypto \
 	    --without-debugger --without-plugins \
+	    --with-pic \
 	    --with-libxml-prefix="$(BUILDROOT_PATH)" \
 	    --with-libxml-include-prefix="$(BUILDROOT_PATH)/include/libxml2" \
 	    --with-libxml-libs-prefix="$(BUILDROOT_PATH)/lib" \
-	    CFLAGS="-I$(BUILDROOT_PATH)/include -I$(BUILDROOT_PATH)/include/libxml2" \
+	    CFLAGS="-I$(BUILDROOT_PATH)/include -I$(BUILDROOT_PATH)/include/libxml2 -fPIC" \
 	    LDFLAGS="-L$(BUILDROOT_PATH)/lib" \
 	    LIBS="-lxml2 -lz" && \
 	  make -C libxslt -j$(NPROC) && \
 	  make -C libexslt -j$(NPROC)'
+
+# libxslt.so: links against libxml2.so (DT_NEEDED libxml2.so), with
+# libxslt's own .o files embedded via --whole-archive. libxml2 itself
+# is NOT embedded — the loader will dlopen libxml2.so transitively
+# when libxslt.so is loaded, so the libxml2 code is shared across
+# every consumer. libposix/libc/libm symbols stay unresolved and
+# bind at dlopen time against the host executable's `.dynsym`.
+$(SHAREDLIB_XSLT): $(STATICLIB_XSLT)
+	sh -c '\
+	  export PATH="$(NANVIX_TOOLCHAIN)/bin:$$PATH" && \
+	  i686-nanvix-gcc -shared -fPIC -nostdlib \
+	    -Wl,-soname,libxslt.so -Wl,-z,noexecstack \
+	    -L$(BUILDROOT_PATH)/lib \
+	    -Wl,--whole-archive $(STATICLIB_XSLT) -Wl,--no-whole-archive \
+	    -lxml2 \
+	    -o $(SHAREDLIB_XSLT)'
+
+# libexslt.so: links against libxslt.so (DT_NEEDED libxslt.so), which
+# transitively brings in libxml2.so. Only libexslt's own .o files are
+# embedded. libposix/libc/libm symbols stay unresolved and bind at
+# dlopen time against the host executable.
+$(SHAREDLIB_EXSLT): $(STATICLIB_EXSLT) $(SHAREDLIB_XSLT)
+	sh -c '\
+	  export PATH="$(NANVIX_TOOLCHAIN)/bin:$$PATH" && \
+	  i686-nanvix-gcc -shared -fPIC -nostdlib \
+	    -Wl,-soname,libexslt.so -Wl,-z,noexecstack \
+	    -L$(BUILDROOT_PATH)/lib -Llibxslt/.libs \
+	    -Wl,--whole-archive $(STATICLIB_EXSLT) -Wl,--no-whole-archive \
+	    -lxslt -lxml2 \
+	    -o $(SHAREDLIB_EXSLT)'
 
 $(TEST_ELF): $(TEST_SRC)
 	@test -f $(STATICLIB_XSLT) || { echo "  FAIL: $(STATICLIB_XSLT) not found; run 'build' first"; exit 1; }
@@ -113,7 +161,17 @@ test:
 	@echo "=== libxslt functional tests ==="
 	@test -f $(STATICLIB_XSLT)  || { echo "  FAIL: $(STATICLIB_XSLT) not found";  exit 1; }
 	@test -f $(STATICLIB_EXSLT) || { echo "  FAIL: $(STATICLIB_EXSLT) not found"; exit 1; }
+	@test -f $(SHAREDLIB_XSLT)  || { echo "  FAIL: $(SHAREDLIB_XSLT) not found";  exit 1; }
+	@test -f $(SHAREDLIB_EXSLT) || { echo "  FAIL: $(SHAREDLIB_EXSLT) not found"; exit 1; }
 	@test -s $(TEST_ELF)        || { echo "  FAIL: $(TEST_ELF) missing or empty"; exit 1; }
+	@$(NANVIX_TOOLCHAIN)/bin/i686-nanvix-readelf -d $(SHAREDLIB_XSLT) | grep -q 'SONAME.*libxslt.so' \
+	  || { echo "  FAIL: SONAME=libxslt.so not set on $(SHAREDLIB_XSLT)"; exit 1; }
+	@$(NANVIX_TOOLCHAIN)/bin/i686-nanvix-readelf -d $(SHAREDLIB_EXSLT) | grep -q 'SONAME.*libexslt.so' \
+	  || { echo "  FAIL: SONAME=libexslt.so not set on $(SHAREDLIB_EXSLT)"; exit 1; }
+	@$(NANVIX_TOOLCHAIN)/bin/i686-nanvix-nm -D $(SHAREDLIB_XSLT) | grep -q 'T xsltParseStylesheetDoc' \
+	  || { echo "  FAIL: xsltParseStylesheetDoc missing from $(SHAREDLIB_XSLT) .dynsym"; exit 1; }
+	@$(NANVIX_TOOLCHAIN)/bin/i686-nanvix-nm -D $(SHAREDLIB_EXSLT) | grep -q 'T exsltRegisterAll' \
+	  || { echo "  FAIL: exsltRegisterAll missing from $(SHAREDLIB_EXSLT) .dynsym"; exit 1; }
 	@echo "  OK: build artifacts present (runtime execution is driven by z.py on the host)"
 	@echo "=== libxslt functional test prerequisites PASSED ==="
 

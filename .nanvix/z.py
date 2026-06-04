@@ -34,7 +34,9 @@ from nanvix_zutil import (
 _BUILD_OUTPUTS = [
     "test_libxslt.elf",
     "libxslt/.libs/libxslt.a",
+    "libxslt/.libs/libxslt.so",
     "libexslt/.libs/libexslt.a",
+    "libexslt/.libs/libexslt.so",
 ]
 
 IS_WINDOWS = sys.platform == "win32"
@@ -306,10 +308,12 @@ class LibxsltBuild(ZScript):
         xslt_inc.mkdir(parents=True)
         exslt_inc.mkdir(parents=True)
 
-        # Copy static libraries.
+        # Copy static and shared libraries.
         for name, src_dir in [
             ("libxslt.a", repo / "libxslt" / ".libs"),
+            ("libxslt.so", repo / "libxslt" / ".libs"),
             ("libexslt.a", repo / "libexslt" / ".libs"),
+            ("libexslt.so", repo / "libexslt" / ".libs"),
         ]:
             src = src_dir / name
             if not src.is_file():
@@ -341,7 +345,12 @@ class LibxsltBuild(ZScript):
         with tarfile.open(str(tarball), "r:gz") as tf:
             members = tf.getnames()
 
-        for expected in ("sysroot/lib/libxslt.a", "sysroot/lib/libexslt.a"):
+        for expected in (
+            "sysroot/lib/libxslt.a",
+            "sysroot/lib/libxslt.so",
+            "sysroot/lib/libexslt.a",
+            "sysroot/lib/libexslt.so",
+        ):
             if expected not in members:
                 raise ValueError(f"Package missing {expected}")
 
